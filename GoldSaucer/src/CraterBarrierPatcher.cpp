@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QDebug>
+#include <QCoreApplication>
 
 namespace {
 
@@ -280,20 +281,31 @@ int CraterBarrierPatcher::patchHighwindDiamondScene(QByteArray& lgp) const
     }
     const int dataEnd = dataStart + dataSize;
 
-    // The Highwind model's init holds:
-    //   push Special[6] (last_field_id) ; push_const 51 ; eq ; goto_if_false 0x21b4
-    // i.e. "if last_field_id == 51 then <reposition + rise cinematic + call
-    // diamond_weapon fn 28>". Anchor on the full gate (the 0x21b4 goto target makes
-    // it unique — a second last_field_id==51 gate near 0x12f8 is left alone), then
-    // rewrite the compared constant 51 -> 0xFFFF so the test is never true and the
-    // whole Diamond block is always skipped (falls through to the normal path).
-    static const QByteArray kGateVanilla  = QByteArray::fromHex("1b0106001001330070000102b421");
-    static const QByteArray kGateModified = QByteArray::fromHex("1b0106001001ffff70000102b421");
+    // the Highwind init runs the Diamond rise cinematic behind an
+    // "if last_field_id == 51" gate. its goto target shifts whenever the
+    // script is recompiled and a second last_field_id==51 gate exists, so
+    // match the gate plus the 20 bytes after the target (unique to this
+    // site in every layout). patch: push_const 51 -> 0xFFFF, never true.
+    static const QByteArray kGatePrefixVanilla = QByteArray::fromHex("1b0106001001330070000102");
+    static const QByteArray kGatePrefixPatched = QByteArray::fromHex("1b0106001001ffff70000102");
+    static const QByteArray kGateFollow =
+        QByteArray::fromHex("000118018d031b010700e000000110010a001903");
 
-    const int at = lgp.indexOf(kGateVanilla, dataStart);
-    if (at < 0 || at >= dataEnd) {
-        const int mod = lgp.indexOf(kGateModified, dataStart);
-        if (mod >= 0 && mod < dataEnd)
+    const auto findGate = [&](const QByteArray& prefix) -> int {
+        int from = dataStart;
+        while (true) {
+            const int at = lgp.indexOf(prefix, from);
+            if (at < 0 || at >= dataEnd)
+                return -1;
+            from = at + 1;
+            if (lgp.mid(at + prefix.size() + 2, kGateFollow.size()) == kGateFollow)
+                return at;
+        }
+    };
+
+    const int at = findGate(kGatePrefixVanilla);
+    if (at < 0) {
+        if (findGate(kGatePrefixPatched) >= 0)
             qDebug() << "CraterBarrierPatcher(highwind-diamond): already patched; skipping";
         else
             qDebug() << "CraterBarrierPatcher(highwind-diamond): Highwind Diamond gate (last_field_id==51) not found";
@@ -331,7 +343,18 @@ int CraterBarrierPatcher::patchCraterLanding(QByteArray& lgp) const
 
 bool CraterBarrierPatcher::patch()
 {
-    const QString src = QDir(m_ff7Path).filePath("data/wm/world_us.lgp");
+    // Prefer the bundled world_us.lgp that ships with the tool so the
+    // mod is self-contained (the Diamond fixes live in wm0.ev inside the lgp). Only fall back
+    // to the builder's install if the asset is missing. The barrier byte-patches below
+    // apply on top of whichever base is used.
+    const QString bundled = QCoreApplication::applicationDirPath() + "/assets/world_us.lgp";
+    QString src = QDir(m_ff7Path).filePath("data/wm/world_us.lgp");
+    if (QFile::exists(bundled)) {
+        src = bundled;
+        qDebug() << "CraterBarrierPatcher: using bundled world_us.lgp asset (self-contained):" << bundled;
+    } else {
+        qDebug() << "CraterBarrierPatcher: no bundled asset; falling back to install world_us.lgp:" << src;
+    }
     const QString dst = QDir(m_outputPath).filePath("data/wm/world_us.lgp");
 
     QFile in(src);
@@ -353,16 +376,15 @@ bool CraterBarrierPatcher::patch()
     // spawn on entry from field 51. Non-fatal if absent (logged inside).
     m_diamondSitesPatched = patchDiamondWeaponSpawn(lgp);
 
-    // Diamond Weapon HIDDEN again (2026-06-20): unlike Ruby, his world-map model
-    // does not render in Free Roam even at world_progress 4, so rather than spawn a
-    // collidable-but-invisible boss we neutralize his ambient (0xEF6.3) spawn —
-    // he never rises from the ocean. (field-51 forced-Highwind spawn stays patched
-    // by patchDiamondWeaponSpawn above.)
-    m_diamondAmbientPatched = patchDiamondAmbientSpawn(lgp);
+    // Diamond Weapon set up as an optional map boss (2026-07-01): we now LEAVE
+    // his ambient (0xEF6.3) model-10 load intact, where our wm0.ev touch script runs trigger_battle(980)
+    // instead of enter_field. The client forces 0xEF6.3 on until he is defeated
+    // (weapons_killed.bit1), and his init/update/touch are gated on that bit so he
+    // stays gone after the win.
+    m_diamondAmbientPatched = 0;
 
-    // Free Roam: also kill the Highwind-init Diamond Weapon scene (the "board the
-    // Highwind after the Forgotten City" cinematic that repositions the Highwind and
-    // calls diamond_weapon fn 28). Gated on last_field_id==51; we make it impossible.
+    // Free Roam: also kill the Highwind-init Diamond Weapon scene
+    // Gated on last_field_id==51
     m_highwindScenePatched = patchHighwindDiamondScene(lgp);
 
     // Free Roam: re-gate the Northern Crater landing/descent on crater_lock (was

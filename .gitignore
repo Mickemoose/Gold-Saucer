@@ -83,6 +83,7 @@ Thumbs.db
 
 # FF7 game files (referenced but not part of project)
 *.lgp
+!GoldSaucer/assets/world_us.lgp
 *.bin
 ff7.exe
 
