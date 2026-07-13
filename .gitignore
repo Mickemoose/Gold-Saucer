@@ -83,7 +83,6 @@ Thumbs.db
 
 # FF7 game files (referenced but not part of project)
 *.lgp
-!GoldSaucer/assets/world_us.lgp
 *.bin
 ff7.exe
 
@@ -104,3 +103,4 @@ Broken Pres Shinra Script.png
 Bugs.txt
 GoldSaucer/Gold Saucer v0.0.2b.zip
 GoldSaucer/Gold Saucer v0.0.3.zip
+GoldSaucer/Gold Saucer v0.0.5.zip

@@ -3,6 +3,7 @@
 
 #include <QString>
 #include <QByteArray>
+#include <QMap>
 
 /**
  * CraterBarrierPatcher
@@ -36,6 +37,9 @@ public:
     // Returns true if the patched world_us.lgp was written (including the
     // idempotent case where the file was already patched).
     bool patch();
+
+    // Path to the loaded .apff7 seed (for reading free_roam + rules.town_gating).
+    void setApJsonPath(const QString& p) { m_apJsonPath = p; }
 
     int sitesPatched() const { return m_sitesPatched; }
 
@@ -77,6 +81,30 @@ private:
     // Returns the number of sites newly patched.
     int patchDiamondAmbientSpawn(QByteArray& lgp) const;
 
+    // Neutralize the SECOND Diamond Weapon caller in wm0.ev: the world-map proximity
+    // handler (fn 92) that runs diamond_weapon fn 28 (rise + enter_field(highwind_
+    // bridge_4)) via `PUSH 29 ; CALL_FN_28` when the player boards the Highwind near
+    // the Diamond entity. Neuter the call (CALL_FN_28 20 02 -> RESET 00 01). Length-
+    // preserving, unique anchor, idempotent. (patchHighwindDiamondScene handles the
+    // other, field-51-gated model-10 caller.)
+    int patchDiamondBoardingScene(QByteArray& lgp) const;
+
+    // Reproduce the Diamond Weapon "optional map boss" edits programmatically (via
+    // the re-offsetting WorldScriptEditor) so the mod no longer ships a hand-edited
+    // world_us.lgp asset. On the player's vanilla wm0.ev this:
+    //   * prepends a kill-gate to Diamond's Model functions 0x4a00/0x4a02/0x4a03
+    //     (RESET; PUSH_SAVEMAP_BIT 985 (0xC1F.1, weapons_killed.bit[1]);
+    //      GOTO_IF_FALSE body; RETURN) so once he is defeated his init/update/touch
+    //     do nothing and he stays gone;
+    //   * replaces the touch handler's rise-cinematic block (…PUSH 53; PUSH 0;
+    //     ENTER_FIELD) with (RESET; PUSH 980; TRIGGER_BATTLE), so touching him on the
+    //     overworld starts battle formation 980 instead of the vanilla map jump. The
+    //     preceding special[8]∈{0,1,2} collision guard is preserved.
+    // Header-anchored (survives recompilation); re-offsets wm0.ev, so it must run
+    // with the other WorldScriptEditor passes, before the content-anchored
+    // patchDiamondBoardingScene. Returns 1 if applied, 0 if not found / already done.
+    int patchDiamondMapBoss(QByteArray& lgp) const;
+
     // Neutralize the Highwind-init Diamond Weapon scene in wm0.ev: the Highwind
     // model's init runs a "if last_field_id == 51" block that repositions the
     // Highwind, plays the rise cinematic, and calls diamond_weapon fn 28. We make
@@ -91,13 +119,38 @@ private:
     // Returns 1 if newly patched, 0 if already patched / not found.
     int patchCraterLanding(QByteArray& lgp) const;
 
+    // Free Roam town gating: insert, into each gated town's world-map Mesh entry
+    // function (just after the movement-mode check, before ENTER_FIELD), a
+    // PUSH_SAVEMAP_BIT <key> ; GOTO_IF_FALSE <return> so the field only loads when the
+    // AP town key flag is set. Uses the re-offsetting WorldScriptEditor (inserts).
+    // Returns the number of towns gated.
+    int patchTownGates(QByteArray& lgp) const;
+
+    // Overwrite world messages in-place (length-preserving) in the 'mes' entry of
+    // `lgp`. `edits` maps message id -> already-encoded FF7-text blob (with its
+    // 0xFF terminator). Keeps numMessages; re-lays the offset table + blobs. Returns
+    // false only if the 'mes' entry can't be found or the result won't fit.
+    bool overwriteWorldMessages(QByteArray& lgp, const QMap<int, QByteArray>& edits) const;
+
+    // Free Roam welcome banner: overwrite world message id 53 (the "Saving on the
+    // World Map" tutorial, shown on first world-map entry) with the FF7 Archipelago
+    // welcome text (rainbow "Archipelago"). Returns 1 if applied.
+    int patchWelcomeMessage(QByteArray& lgp) const;
+
+    // Encode plain ASCII to FF7 world text (byte = char-0x20). No terminator —
+    // callers append control codes / 0xFF.
+    static QByteArray encodeWorldText(const QString& s);
+
     static quint32 readU32(const QByteArray& d, int off);
 
     QString m_ff7Path;
     QString m_outputPath;
+    QString m_apJsonPath;
     int     m_sitesPatched = 0;
     int     m_diamondSitesPatched = 0;
     int     m_diamondAmbientPatched = 0;
+    int     m_diamondBoardingPatched = 0;
+    int     m_diamondBossPatched = 0;
     int     m_highwindScenePatched = 0;
     int     m_craterLandingPatched = 0;
 };
