@@ -44,9 +44,10 @@ public:
     int sitesPatched() const { return m_sitesPatched; }
 
 private:
-    // Locate wm0.ev (overworld script) within an LGP buffer. Returns false if
-    // the archive or the entry cannot be found. On success, dataStart/dataSize
-    // describe the wm0.ev payload region within `lgp`.
+    // Locate a named .ev file (wm0.ev/wm2.ev/...) within an LGP buffer. Returns
+    // false if the archive or the entry cannot be found. On success,
+    // dataStart/dataSize describe the payload region within `lgp`.
+    bool findEvFile(const QByteArray& lgp, const char* name, int& dataStart, int& dataSize) const;
     bool findWm0(const QByteArray& lgp, int& dataStart, int& dataSize) const;
 
     // Patch the barrier conditions in `lgp` in place. Returns the number of
@@ -105,6 +106,13 @@ private:
     // patchDiamondBoardingScene. Returns 1 if applied, 0 if not found / already done.
     int patchDiamondMapBoss(QByteArray& lgp) const;
 
+    // Wrap every RESET;PUSH modelId;LOAD_MODEL site in evName with a
+    // PUSH_SAVEMAP_BIT keyBit gate so the entity only loads when the client
+    // has set the bit. Ultimate is wm0.ev model 11 bit 7210, Emerald is
+    // wm2.ev model 30 bit 7230. Idempotent and fail safe, returns site count.
+    int patchWeaponLoadGate(QByteArray& lgp, const char* evName, int modelId,
+                            int keyBit, const char* label) const;
+
     // Neutralize the Highwind-init Diamond Weapon scene in wm0.ev: the Highwind
     // model's init runs a "if last_field_id == 51" block that repositions the
     // Highwind, plays the rise cinematic, and calls diamond_weapon fn 28. We make
@@ -151,6 +159,8 @@ private:
     int     m_diamondAmbientPatched = 0;
     int     m_diamondBoardingPatched = 0;
     int     m_diamondBossPatched = 0;
+    int     m_ultimateGatePatched = 0;
+    int     m_emeraldGatePatched = 0;
     int     m_highwindScenePatched = 0;
     int     m_craterLandingPatched = 0;
 };

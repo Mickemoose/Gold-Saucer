@@ -103,7 +103,7 @@ quint32 CraterBarrierPatcher::readU32(const QByteArray& d, int off)
           | (static_cast<quint8>(d[off + 3]) << 24);
 }
 
-bool CraterBarrierPatcher::findWm0(const QByteArray& lgp, int& dataStart, int& dataSize) const
+bool CraterBarrierPatcher::findEvFile(const QByteArray& lgp, const char* fileName, int& dataStart, int& dataSize) const
 {
     // LGP layout: 12-byte creator, 4-byte file count, then N x 27-byte ToC
     // entries [20 name][4 offset][1 check][2 conflict]. Each file body is
@@ -119,7 +119,7 @@ bool CraterBarrierPatcher::findWm0(const QByteArray& lgp, int& dataStart, int& d
         QByteArray name = lgp.mid(entry, 20);
         int nul = name.indexOf('\0');
         if (nul >= 0) name.truncate(nul);
-        if (QString::fromLatin1(name).compare(QStringLiteral("wm0.ev"), Qt::CaseInsensitive) == 0) {
+        if (QString::fromLatin1(name).compare(QLatin1String(fileName), Qt::CaseInsensitive) == 0) {
             const quint32 fileOff = readU32(lgp, entry + 20);
             if (static_cast<int>(fileOff) + 24 > lgp.size()) return false;
             const quint32 size = readU32(lgp, fileOff + 20);
@@ -130,6 +130,11 @@ bool CraterBarrierPatcher::findWm0(const QByteArray& lgp, int& dataStart, int& d
         }
     }
     return false;
+}
+
+bool CraterBarrierPatcher::findWm0(const QByteArray& lgp, int& dataStart, int& dataSize) const
+{
+    return findEvFile(lgp, "wm0.ev", dataStart, dataSize);
 }
 
 int CraterBarrierPatcher::patchWorldScript(QByteArray& lgp, bool& ok) const
@@ -506,6 +511,77 @@ int CraterBarrierPatcher::patchDiamondMapBoss(QByteArray& lgp) const
     qDebug() << "CraterBarrierPatcher(diamond-boss): touch -> trigger_battle(980);"
              << gates << "kill-gate(s) on model 0x4a";
     return 1;
+}
+
+int CraterBarrierPatcher::patchWeaponLoadGate(QByteArray& lgp, const char* evName,
+                                              int modelId, int keyBit, const char* label) const
+{
+    int dataStart = 0, dataSize = 0;
+    if (!findEvFile(lgp, evName, dataStart, dataSize)) {
+        qDebug() << "CraterBarrierPatcher(" << label << "):" << evName << "not found";
+        return 0;
+    }
+    QByteArray ev = lgp.mid(dataStart, dataSize);
+    WorldScriptEditor w;
+    QString err;
+    if (!w.parse(ev, err)) {
+        qDebug() << "CraterBarrierPatcher(" << label << "):" << evName << "parse failed —" << err;
+        return 0;
+    }
+
+    // Idempotence: the client-owned keyBit is never referenced in a vanilla ev;
+    // any existing PUSH_SAVEMAP_BIT keyBit means this gate was already inserted.
+    for (int i = 0; i < w.instrCount(); ++i)
+        if (w.opAt(i) == 0x114 && int(w.paramAt(i, 0)) == keyBit) {
+            qDebug() << "CraterBarrierPatcher(" << label << "): already patched; skipping";
+            return 0;
+        }
+
+    // Every load of the WEAPON's model, canonical shape: RESET ; PUSH modelId ;
+    // LOAD_MODEL. (All Ultimate/Emerald sites match; anything else is left alone.)
+    QVector<int> sites;
+    for (int i = 2; i < w.instrCount(); ++i)
+        if (w.opAt(i) == 0x300                                        // LOAD_MODEL
+            && w.opAt(i - 1) == 0x110 && int(w.paramAt(i - 1, 0)) == modelId
+            && w.opAt(i - 2) == 0x100)                                // RESET
+            sites.append(i);
+    if (sites.isEmpty()) {
+        qDebug() << "CraterBarrierPatcher(" << label << "): no RESET;PUSH" << modelId
+                 << ";LOAD_MODEL sites in" << evName << "- skipping";
+        return 0;
+    }
+
+    auto W16 = [](QByteArray& b, int v){ b.append(char(v & 0xFF)); b.append(char((v >> 8) & 0xFF)); };
+    // Gate each site: PUSH_SAVEMAP_BIT keyBit ; GOTO_IF_FALSE -> <after LOAD>.
+    // The preceding RESET leaves the stack clean at the splice point. High-index
+    // first so earlier site indices stay valid. Abort before assemble on any
+    // refusal — the lgp is only touched after a fully successful edit.
+    int gated = 0;
+    for (int si = sites.size() - 1; si >= 0; --si) {
+        const int P = sites[si] - 1;                       // the PUSH modelId
+        QByteArray pushKey; W16(pushKey, 0x114); W16(pushKey, keyBit);
+        if (!w.insertBefore(P, pushKey, err)) {
+            qDebug() << "CraterBarrierPatcher(" << label << "): key push failed —" << err;
+            return 0;
+        }
+        // post-insert: [P]=PUSH_BIT [P+1]=PUSH model [P+2]=LOAD; goto skips to P+3
+        // (insertGoto bumps the target across itself -> lands just after LOAD).
+        if (!w.insertGoto(P + 1, /*ifFalse*/true, P + 3, err)) {
+            qDebug() << "CraterBarrierPatcher(" << label << "): skip-goto failed —" << err;
+            return 0;
+        }
+        ++gated;
+    }
+
+    const QByteArray out = w.assemble(err);
+    if (out.isEmpty()) {
+        qDebug() << "CraterBarrierPatcher(" << label << "): assemble failed —" << err;
+        return 0;
+    }
+    lgp.replace(dataStart, dataSize, out);
+    qDebug() << "CraterBarrierPatcher(" << label << "): gated" << gated << "model-" << modelId
+             << "load(s) in" << evName << "on savemap bit" << keyBit;
+    return gated;
 }
 
 int CraterBarrierPatcher::patchHighwindDiamondScene(QByteArray& lgp) const
@@ -903,6 +979,11 @@ bool CraterBarrierPatcher::patch()
     // patchDiamondBoardingScene below.
     m_diamondBossPatched = patchDiamondMapBoss(lgp);
 
+    // Gate Ultimate and Emerald model loads on the client owned arrival bits
+    // so their entities do not exist below the arrival threshold.
+    m_ultimateGatePatched = patchWeaponLoadGate(lgp, "wm0.ev", 11, 7210, "ultimate-gate");
+    m_emeraldGatePatched  = patchWeaponLoadGate(lgp, "wm2.ev", 30, 7230, "emerald-gate");
+
     // Free Roam welcome banner: overwrite the world save-tutorial message (id 53,
     // shown on first world-map entry) with the FF7 Archipelago welcome text.
     patchWelcomeMessage(lgp);
@@ -941,6 +1022,8 @@ bool CraterBarrierPatcher::patch()
              << m_diamondAmbientPatched << "Diamond Weapon (ambient) site(s),"
              << m_highwindScenePatched << "Diamond Weapon (Highwind scene) site(s),"
              << m_diamondBossPatched << "Diamond Weapon (map-boss) pass,"
+             << m_ultimateGatePatched << "Ultimate load gate(s),"
+             << m_emeraldGatePatched << "Emerald load gate(s),"
              << m_craterLandingPatched << "crater-landing site(s) newly patched)";
     return true;
 }
