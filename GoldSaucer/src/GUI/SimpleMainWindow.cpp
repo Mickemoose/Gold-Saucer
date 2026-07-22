@@ -1,3 +1,4 @@
+#include "../ApSeedFile.h"
 #include <QApplication>
 #include <QMainWindow>
 #include <QVBoxLayout>
@@ -35,7 +36,6 @@
 #include "../Randomizer.h"
 #include "../Config.h"
 #include "../IroExporter.h"
-#include "../ApSeedFile.h"
 
 SimpleMainWindow::SimpleMainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -585,9 +585,9 @@ void SimpleMainWindow::importArchipelagoJSON()
     
     // Sync seed and randomizer settings from AP JSON
     {
-        QByteArray seedData = ApSeedFile::readJson(filePath);
-        if (!seedData.isEmpty()) {
-            QJsonDocument seedDoc = QJsonDocument::fromJson(seedData);
+        const QByteArray seedJson = ApSeedFile::readJson(filePath);
+        if (!seedJson.isEmpty()) {
+            QJsonDocument seedDoc = QJsonDocument::fromJson(seedJson);
             QJsonObject seedRoot = seedDoc.object();
 
             if (seedRoot.contains("seed")) {
@@ -694,9 +694,9 @@ void SimpleMainWindow::toggleArchipelagoMode(bool enabled)
 
 bool SimpleMainWindow::validateArchipelagoJSON(const QString& filePath)
 {
-    // .apff7 is an APPlayerContainer zip (or legacy bare JSON); ApSeedFile::readJson
-    // sniffs the PK magic and returns the ff7_seed.json payload for either format.
-    QByteArray data = ApSeedFile::readJson(filePath);
+    // Reads both formats: legacy bare JSON and the APPlayerContainer zip
+    // (archipelago.json manifest + ff7_seed.json payload) the apworld now emits.
+    const QByteArray data = ApSeedFile::readJson(filePath);
     if (data.isEmpty()) {
         return false;
     }
