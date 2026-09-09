@@ -73,6 +73,8 @@ public:
     // the newly-inserted head instead of the original body. `instrIdx` must be a
     // current instruction index.
     bool setEntryStart(int tableIndex, int instrIdx, QString &err);
+    // Add a function to the call table, keeping it sorted; returns its slot or -1.
+    int insertEntry(quint16 header, int instrIdx, QString &err);
 
     // Re-emit the whole 0x7000 EV with offsets/targets recomputed.
     QByteArray assemble(QString &err) const;

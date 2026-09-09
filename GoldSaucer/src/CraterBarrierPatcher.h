@@ -119,6 +119,10 @@ private:
     // the comparison impossible (push 51 -> push 0xFFFF) so the block is always
     // skipped. Length-preserving (2 bytes), unique anchor, idempotent.
     int patchHighwindDiamondScene(QByteArray& lgp) const;
+    // Make the battle-return Ruby load check her spawn flag 0xF2B.4 instead of 0xF2A.4.
+    int patchRubyBattleReturnLoad(QByteArray& lgp) const;
+    // WEAPON Arrival roar sound and banner, triggered by client bits 0x405.0-3 (messages 35/36/49/50).
+    int patchWeaponArrivalScenes(QByteArray& lgp) const;
     // Make Ultimate Weapon's crater-crash cinematic reachable in Free Roam.
     // highwind_init runs it (call_function(ultima_weapon, 27)) but only inside
     // `if Special.unknown_5 == 1`, and the preceding `if unknown_5 == 0` block

@@ -222,6 +222,21 @@ bool WorldScriptEditor::insertGoto(int idx, bool ifFalse, int targetIdx, QString
     return true;
 }
 
+int WorldScriptEditor::insertEntry(quint16 header, int instrIdx, QString &err)
+{
+    if (!m_valid) { err = "not parsed"; return -1; }
+    if (instrIdx < 0 || instrIdx >= m_instrs.size()) { err = "instruction index out of range"; return -1; }
+    if (m_entries.last().header != 0xFFFF) { err = "call table full"; return -1; }
+    int pos = 1;
+    while (pos < m_entries.size() && m_entries[pos].header != 0xFFFF && m_entries[pos].header < header) ++pos;
+    if (pos < m_entries.size() && m_entries[pos].header == header) { err = "header already present"; return -1; }
+    for (int i = m_entries.size() - 1; i > pos; --i) m_entries[i] = m_entries[i - 1];
+    m_entries[pos].header = header;
+    m_entries[pos].rawOffset = 0;
+    m_entries[pos].idx = instrIdx;
+    return pos;
+}
+
 bool WorldScriptEditor::setEntryStart(int tableIndex, int instrIdx, QString &err)
 {
     if (!m_valid) { err = "not parsed"; return false; }
