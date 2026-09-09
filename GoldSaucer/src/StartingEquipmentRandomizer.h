@@ -15,7 +15,10 @@ class StartingEquipmentRandomizer
 public:
     explicit StartingEquipmentRandomizer(Randomizer* parent);
     
-    bool randomize();
+    // `shuffleEquipment` gates ONLY the random starting gear. The starting-level
+    // patch below is applied unconditionally, so it still lands when the player
+    // has starting-equipment randomization switched off.
+    bool randomize(bool shuffleEquipment = true);
     
 private:
     Randomizer* m_parent;
@@ -35,18 +38,17 @@ private:
     
     bool randomizeAll();
     void randomizeStartingEquipment(QByteArray& data);
-    void randomizeCharacterEquipment(QByteArray& data, int characterId);
+
+    // Starting level. Rewrites a character's kernel section-3 init record so a NEW
+    // GAME begins at that level, with stats/HP/MP taken from their own growth
+    // curves in section 2. `growthData` is kernel section 2 (may be empty, in
+    // which case the patch is skipped rather than writing a half-levelled record).
+    void applyStartingLevels(QByteArray& initData, const QByteArray& growthData);
+    bool growthStatsAt(const QByteArray& growthData, int characterId, int level,
+                       quint8 stats[6], quint16& hp, quint16& mp) const;
     
-    quint16 getRandomWeapon(int characterId, int tier);
-    quint16 getRandomArmor(int tier);
-    quint16 getRandomAccessory(int tier);
-    void randomizeMateria(QByteArray& data, int characterId);
     
     // Equipment pools by tier and character
-    QMap<int, QVector<quint16>> m_weaponPools[3]; // 3 tiers
-    QVector<quint16> m_armorPools[3];            // 3 tiers
-    QVector<quint16> m_accessoryPools[3];        // 3 tiers
-    QVector<quint16> m_materiaPools[3];          // 3 tiers
     
     // Text replacement integration
     bool replaceStartingEquipmentText();
@@ -60,7 +62,6 @@ private:
     QMap<int, quint16> m_randomizedAccessories;
     QMap<int, QVector<quint16>> m_randomizedMateria;
     
-    void initializeEquipmentPools();
     
     enum Character {
         Cloud = 0,
