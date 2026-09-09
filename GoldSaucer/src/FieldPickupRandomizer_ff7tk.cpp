@@ -9,6 +9,7 @@
 #include <QTextStream>
 #include <QFileInfo>
 #include <QDateTime>
+#include <QStorageInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -103,9 +104,17 @@ FieldPickupRandomizer_ff7tk::~FieldPickupRandomizer_ff7tk()
 // randomize()  –  main entry point from Randomizer::randomizeFieldPickups()
 // ============================================================================
 
+bool FieldPickupRandomizer_ff7tk::fail(const QString& reason)
+{
+    m_lastError = reason;
+    qCritical() << "Field pickup randomization FAILED:" << reason;
+    return false;
+}
+
 bool FieldPickupRandomizer_ff7tk::randomize()
 {
     qDebug() << "FieldPickupRandomizer_ff7tk::randomize() called";
+    m_lastError.clear();
 
     // --- build item pools ---------------------------------------------------
     initializeItemPools();
@@ -113,8 +122,15 @@ bool FieldPickupRandomizer_ff7tk::randomize()
     // --- locate flevel.lgp --------------------------------------------------
     QString flevelPath = findFlevelPath();
     if (flevelPath.isEmpty()) {
-        qDebug() << "ERROR: Could not find flevel.lgp";
-        return false;
+        // Name every path tried: the usual cause is a game root one level off
+        // (the 2026 re-release nests everything under ff7/workingdir), and the
+        // list makes that obvious at a glance.
+        return fail(QStringLiteral(
+                        "Could not find flevel.lgp. Looked in:%1  %2%1"
+                        "Check that the FF7 folder you picked is the one containing "
+                        "ff7_en.exe and a data folder.")
+                        .arg(QStringLiteral("\n"),
+                             flevelCandidates().join(QStringLiteral("\n  "))));
     }
     qDebug() << "Found flevel.lgp at:" << flevelPath;
 
@@ -135,8 +151,17 @@ bool FieldPickupRandomizer_ff7tk::randomize()
     // --- open LGP using the proven MakouLgpManager --------------------------
     MakouLgpManager lgp;
     if (!lgp.open(flevelPath)) {
-        qDebug() << "ERROR: Failed to open LGP:" << lgp.lastError();
-        return false;
+        const QFileInfo fi(flevelPath);
+        return fail(QStringLiteral("Could not open flevel.lgp (%1).\n"
+                                   "File: %2\nSize: %3 bytes%4")
+                        .arg(lgp.lastError().isEmpty() ? QStringLiteral("no reason given")
+                                                       : lgp.lastError(),
+                             flevelPath,
+                             QString::number(fi.size()),
+                             fi.isReadable()
+                                 ? QString()
+                                 : QStringLiteral("\nThe file is not readable - check "
+                                                  "permissions, or whether the game is running.")));
     }
 
     QStringList allFiles = lgp.fileList();
@@ -147,6 +172,16 @@ bool FieldPickupRandomizer_ff7tk::randomize()
     QFile debugFile(debugPath);
     bool debugOk = debugFile.open(QIODevice::WriteOnly | QIODevice::Truncate);
     QTextStream debugStream(&debugFile);
+    if (!debugOk) {
+        // Not fatal - the pass runs fine without it - but it silently removes
+        // every per-field diagnostic, so say so rather than leave the user
+        // hunting for a file that was never written.
+        qWarning() << "Could not open the field debug log at" << debugPath
+                   << "-" << debugFile.errorString()
+                   << "- per-field detail will be missing from this run.";
+    } else {
+        qDebug() << "Field debug log:" << debugPath;
+    }
     if (debugOk) {
         debugStream << "=== Field Pickup Randomization ===\n";
         debugStream << "Date      : " << QDateTime::currentDateTime().toString() << "\n";
@@ -161,11 +196,23 @@ bool FieldPickupRandomizer_ff7tk::randomize()
         QString apJson = m_parent->m_config.getApJsonPath();
         if (apJson.isEmpty()) {
             if (debugOk) debugStream << "AP JSON: path not configured in config.json (apJsonPath)\n";
-            return false;
+            return fail(QStringLiteral(
+                "Archipelago mode is on but no seed file is loaded. Go back to the "
+                "seed step and import your .apff7, or turn Archipelago integration off."));
         }
         if (!loadApJson(apJson, debugStream)) {
             if (debugOk) debugStream << "AP JSON: failed to load " << apJson << "\n";
-            return false;
+            const QFileInfo fi(apJson);
+            return fail(QStringLiteral("Could not read the Archipelago seed file.\n"
+                                       "File: %1\n%2")
+                            .arg(apJson,
+                                 !fi.exists()
+                                     ? QStringLiteral("It does not exist - it may have been moved "
+                                                      "or deleted since it was selected.")
+                                 : fi.size() == 0
+                                     ? QStringLiteral("It is empty (0 bytes).")
+                                     : QStringLiteral("It exists but could not be parsed as an FF7 "
+                                                      "seed - re-export it from Archipelago.")));
         }
     }
 
@@ -378,8 +425,16 @@ bool FieldPickupRandomizer_ff7tk::randomize()
     // --- save LGP -----------------------------------------------------------
     if (filesWithChanges > 0) {
         if (!lgp.save(outputFlevel)) {
-            qDebug() << "ERROR: Failed to save LGP:" << lgp.lastError();
-            return false;
+            const QStorageInfo out(QFileInfo(outputFlevel).absolutePath());
+            return fail(QStringLiteral(
+                            "Could not write the randomized flevel.lgp (%1).\n"
+                            "Target: %2\nFree space on that drive: %3 MB\n"
+                            "Close the game and any tool holding that file, and make sure "
+                            "the output folder is writable.")
+                            .arg(lgp.lastError().isEmpty() ? QStringLiteral("no reason given")
+                                                           : lgp.lastError(),
+                                 outputFlevel,
+                                 QString::number(out.bytesAvailable() / (1024 * 1024))));
         }
         qDebug() << "Saved randomised LGP to:" << outputFlevel;
     } else {
@@ -605,8 +660,10 @@ bool FieldPickupRandomizer_ff7tk::processFieldFile(
     // softlock. See nopFieldScriptSplits.
     // Free Roam: the Northern Crater party splits leave a partial roster with a
     // solo-Cloud party forever (the "make a new team" screen is gated on MORE than
-    // three characters going Cloud's way). NOP the party-wiping PRTYE — see
-    // nopCraterPartyWipe.
+    // three characters going Cloud's way). NOP the party-wiping PRTYE — and the
+    // seven PRTYP party ADDS, which would otherwise hand the player characters
+    // Archipelago never granted whenever their chosen direction matches Cloud's.
+    // See nopCraterPartyWipe.
     if (freeRoam && (fieldName.toLower() == "las0_8" || fieldName.toLower() == "las2_1")) {
         if (nopCraterPartyWipe(decompressed, fieldName, debugStream) > 0)
             totalMods++;
@@ -726,6 +783,163 @@ bool FieldPickupRandomizer_ff7tk::processFieldFile(
             debugStream << "  UJUNON2: NOP'd Priscilla drown MESSAGE @" << msg << "\n";
         } else {
             debugStream << "  UJUNON2: drown MESSAGE anchor not found/ambiguous\n";
+        }
+    }
+    if (freeRoam && fieldName.toLower() == "las4_1") {
+        // ── Point of no return: block the final descent without a full party ──
+        //
+        // las4_1 has two trigger-line entities over the SAME line, `l2` and `l3`,
+        // each armed by its own story gate in its init script:
+        //
+        //   d0 ..(13B)..                 LINE      define the line
+        //   16 20 00 00 ce 07 0X 03      IFSW      game_moment <oper> 1998
+        //   d1 00                        LINON 00  disable the line
+        //   00                           RET
+        //
+        // IF opcodes jump when the comparison is FALSE, so at Free Roam's pinned
+        // moment of 1997:
+        //   l3  oper 03 (<)   1997 <  1998 TRUE  -> LINON 00 runs -> line DEAD
+        //   l2  oper 04 (>=)  1997 >= 1998 FALSE -> jumps past it -> line LIVE
+        //
+        // So **l2 is the trigger that commits the descent in Free Roam**, and it
+        // is the one to gate. (Crossing it REQEWs `dic` script 3, which holds the
+        // MAPJUMP; l3's cross script has an identical MAPJUMP but never fires.)
+        // l3 is deliberately left alone -- its line is already off.
+        //
+        // Re-point l2's gate at OUR party byte. IFSW is 8 bytes and IFUB is 6, so
+        // IFUB + two NOPs occupies exactly the same space and the LINON does not
+        // move -- the same length-preserving discipline the crater barrier patch
+        // uses. Nothing is inserted, so no offsets or jumps elsewhere in the field
+        // need recomputing.
+        //
+        //   14 30 84 00 00 05 5f 5f
+        //   |  |  |  |  |  |
+        //   |  |  |  |  |  +-- jump 5: operand at +5, target +10 = just past LINON
+        //   |  |  |  |  +----- oper 0 (==)      [Makou: 0 == 1 != 2 > 3 < 4 >= ...]
+        //   |  |  |  +-------- value 0
+        //   |  |  +----------- addr 0x84 -> savemap 0x0CA4 + 0x84 = 0x0D28
+        //   |  +-------------- banks BANK(3,0): left bank 3, right literal
+        //   +----------------- IFUB
+        //
+        // party gate == 0 -> TRUE  -> falls through the NOPs into LINON 00, and
+        //                             the line is simply dead: the player walks
+        //                             into it and nothing happens. No message, no
+        //                             bounce, no warp -- the game's own toggle.
+        // party gate == 1 -> FALSE -> jumps past LINON -> vanilla behaviour.
+        //
+        // FF7Client drives 0x0D28 from the six canonical characters every poll.
+        //
+        // The anchor deliberately includes the 13-byte LINE that precedes the
+        // gate: the 8-byte IFSW alone appears TWICE in this field (l2 and the
+        // `modo` entity), and patching the wrong one would do nothing useful.
+        // With the LINE included it is unique here and absent from every other
+        // field in flevel.
+        const QByteArray anchor = QByteArray::fromHex(
+            "d06efd58ffacff2cfe8eff9eff" "16200000ce070403" "d100");
+        const int a = decompressed.indexOf(anchor);
+        if (a >= 0 && decompressed.indexOf(anchor, a + 1) < 0) {
+            const QByteArray gate = QByteArray::fromHex("1430840000055f5f");
+            for (int j = 0; j < gate.size(); ++j)
+                decompressed[a + 13 + j] = gate.at(j);   // +13 = past the LINE
+            ++totalMods;
+            debugStream << "  LAS4_1: point-of-no-return line (l2) now gated on "
+                           "the party byte 0x0D28 @" << (a + 13) << "\n";
+        } else {
+            debugStream << "  LAS4_1 WARN: l2 story-gate anchor not found/ambiguous "
+                           "— the descent is NOT party-gated in this build\n";
+        }
+
+        // ── ...and tell the player why ────────────────────────────────────
+        //
+        // With l2 dead the player just walks over the spot and nothing happens,
+        // which reads as a bug. `l3` is l2's twin on IDENTICAL line geometry,
+        // already dead in Free Roam (its gate is oper 03 `<`, and 1997 < 1998 is
+        // TRUE, so its LINON 00 always runs). Re-arm it as the INVERSE of l2, so
+        // exactly one of the pair is live at any time:
+        //
+        //   l2   Var[3][132] == 0 -> disable   live when the party is COMPLETE
+        //   l3   Var[3][132] != 0 -> disable   live when the party is INCOMPLETE
+        //
+        // Same length-preserving IFUB+NOP trick, only the operator differs
+        // (1 = `!=` where l2 uses 0 = `==`).
+        {
+            const QByteArray anchor = QByteArray::fromHex(
+                "d06efd58ffacff2cfe8eff9eff" "16200000ce070303" "d100");
+            const int a = decompressed.indexOf(anchor);
+            if (a >= 0 && decompressed.indexOf(anchor, a + 1) < 0) {
+                // 10 bytes: IFUB (6) + IDLCK (4), exactly filling the space
+                // vanilla spent on IFSW (8) + LINON (2).
+                //
+                //   14 30 84 00 00 05   if Var[3][132] == 0 -> fall through
+                //   6d 51 00 01         IDLCK triangle 81, locked
+                //
+                // Deciding this in INIT rather than on the line crossing is what
+                // makes the block reversible: the field re-runs Init on every
+                // entry, so a player who returns having recruited the missing
+                // characters finds the triangle walkable again. Locking it from
+                // the crossing script could only ever take the path away, never
+                // give it back. It also blocks BEFORE the player reaches the
+                // line, rather than letting them step over it first.
+                //
+                // The jump operand sits at +5 and targets +10, clearing the
+                // IDLCK. Note l3's LINON is gone with the IFSW, so its line is
+                // now always live; the crossing script below is what decides
+                // whether anything happens.
+                const QByteArray gate = QByteArray::fromHex("143084000005"
+                                                            "6d510001");
+                for (int j = 0; j < gate.size(); ++j)
+                    decompressed[a + 13 + j] = gate.at(j);
+                ++totalMods;
+                debugStream << "  LAS4_1: l3 Init locks walkmesh triangle 81 while the party is short @"
+                            << (a + 13) << "\n";
+            } else {
+                debugStream << "  LAS4_1 WARN: l3 story-gate anchor not found\n";
+            }
+        }
+
+        // l3's cross script (Go 1x) ends in the same descent MAPJUMP as l2's
+        // path. Swap those 10 bytes for a MESSAGE and pad the rest with NOPs, so
+        // crossing while short-handed shows a line instead of moving anywhere.
+        // The surrounding UC/menu lock is vanilla and left intact, so the player
+        // is held still for the message and released afterwards.
+        //
+        // Message 18 is VANILLA text already in this field -- "Where're <name>
+        // and the others?" -- one of the party-check lines las4_1 ships with.
+        // Reusing it keeps the text section untouched, which matters: adding an
+        // entry would move the section and force every offset in the field to be
+        // recomputed. To use a different existing line, change the LAST byte
+        // (the message id) -- 4 is "Don't leave us.", 5 is "I can't let you guys
+        // go by yourselves", 7 is "You sure are hasty."
+        //
+        // The anchor includes the two opcodes before the MAPJUMP: the MAPJUMP
+        // bytes alone appear TWICE in this field, because `dic` script 3 (l2's
+        // legitimate path) holds an identical one, and patching that would break
+        // the descent for a player who has earned it.
+        {
+            const QByteArray anchor = QByteArray::fromHex("33014a01"
+                                                          "60fb02eefdba00140000");
+            const int a = decompressed.indexOf(anchor);
+            if (a >= 0 && decompressed.indexOf(anchor, a + 1) < 0) {
+                // 10 bytes: IFUB (6) + MESSAGE (3) + NOP (1).
+                //
+                //   14 30 84 00 00 04   if Var[3][132] == 0 -> fall through
+                //   40 00 12            MESSAGE 18
+                //   5f                  NOP
+                //
+                // The message needs its own gate now that l3's line is always
+                // live: without it, a player who HAS the party would cross and
+                // be told they do not. Jump operand at +5 targets +9, clearing
+                // the MESSAGE.
+                const QByteArray say = QByteArray::fromHex("143084000004"
+                                                           "400012" "5f");
+                for (int j = 0; j < say.size(); ++j)
+                    decompressed[a + 4 + j] = say.at(j);
+                ++totalMods;
+                debugStream << "  LAS4_1: l3 cross script shows message 18 (gated) @"
+                            << (a + 4) << "\n";
+            } else {
+                debugStream << "  LAS4_1 WARN: l3 cross-script anchor not found\n";
+            }
         }
     }
     if (freeRoam && fieldName.toLower() == "fship_3") {
@@ -1932,7 +2146,13 @@ bool FieldPickupRandomizer_ff7tk::processFieldFile(
                 int parity = v % 2;
                 STITMInfo& info = stitmCandidates[validIndices[v]];
                 if (!bitonByParity.contains(parity)) {
-                    if (applySTITMAsArchipelago(info, decompressed, fieldName, debugStream)) {
+                    QByteArray text; int lines = 1, cols = 0;
+                    const QString vanilla = getItemName(info.originalItemID);
+                    if (applySTITMAsArchipelago(info, decompressed, fieldName, debugStream,
+                                                &text, &lines, &cols)) {
+                        if (!text.isEmpty())
+                            modifications.append(
+                                OpcodeModification(info.offset, text, lines, cols, vanilla));
                         ParityBiton pb;
                         pb.bankByte = static_cast<quint8>(static_cast<unsigned char>(decompressed[info.offset + 1]));
                         pb.addr     = static_cast<quint8>(static_cast<unsigned char>(decompressed[info.offset + 2]));
@@ -1962,8 +2182,15 @@ bool FieldPickupRandomizer_ff7tk::processFieldFile(
             // Archipelago mode: replace each STITM with a unique BITON from the queue
             for (int idx : validIndices) {
                 STITMInfo& info = stitmCandidates[idx];
-                if (applySTITMAsArchipelago(info, decompressed, fieldName, debugStream))
+                QByteArray text; int lines = 1, cols = 0;
+                const QString vanilla = getItemName(info.originalItemID);
+                if (applySTITMAsArchipelago(info, decompressed, fieldName, debugStream,
+                                            &text, &lines, &cols)) {
+                    if (!text.isEmpty())
+                        modifications.append(
+                            OpcodeModification(info.offset, text, lines, cols, vanilla));
                     totalMods++;
+                }
             }
         }
     } else {
@@ -2014,8 +2241,15 @@ bool FieldPickupRandomizer_ff7tk::processFieldFile(
     for (SMTRAInfo& info : smtraCandidates) {
         if (!validateSMTRA(info)) continue;
         if (apMode) {
-            if (applySMTRAAsArchipelago(info, decompressed, fieldName, debugStream))
+            QByteArray text; int lines = 1, cols = 0;
+            const QString vanilla = getMateriaName(info.originalMateriaID);
+            if (applySMTRAAsArchipelago(info, decompressed, fieldName, debugStream,
+                                        &text, &lines, &cols)) {
+                if (!text.isEmpty())
+                    modifications.append(
+                        OpcodeModification(info.offset, text, lines, cols, vanilla));
                 totalMods++;
+            }
         } else {
             quint8 newMateriaID = getRandomMateria();
             if (applySMTRARandomization(info, decompressed, newMateriaID, debugStream)) {
@@ -2027,7 +2261,8 @@ bool FieldPickupRandomizer_ff7tk::processFieldFile(
 
     // --- Vanilla BITON replacement for Key Items in AP mode -----------------
     if (apMode) {
-        int vanillaMods = replaceVanillaBitonsForAP(decompressed, fieldName, debugStream);
+        int vanillaMods = replaceVanillaBitonsForAP(decompressed, fieldName, debugStream,
+                                                   &modifications);
         if (vanillaMods > 0) {
             totalMods += vanillaMods;
         }
@@ -4263,6 +4498,35 @@ static int nopCraterPartyWipe(QByteArray& d, const QString& fieldName, QTextStre
                     dbg << "  CRATER_SPLIT: " << fieldName
                         << " NOP'd party-wipe PRTYE 0,FE,FE @" << (pos - sd) << "\n";
                 }
+                // PRTYP (0xC8, 2 bytes) - "add <char> to the current party".
+                //
+                // The split gives every character a direction, then runs seven of
+                // these, each gated on that character having picked Cloud's way:
+                //
+                //   14 dd 55 54 00 03   if Var[13][0x55] == 84   (their direction)
+                //   c8 01               PRTYP -> add Barret
+                //
+                // In Free Roam that hands the player characters Archipelago never
+                // granted: walk into the crater short-handed, pick the matching
+                // direction, and the roster fills itself in. Worse since the
+                // endgame party gate went in, because the party is now the thing
+                // being checked. Reported from play 2026-09-08.
+                //
+                // Dropping the PRTYP leaves the IFUB in front of it evaluating
+                // harmlessly - its jump already targets the byte after the PRTYP,
+                // so the branch lands in the same place either way and the party
+                // stays exactly what the player earned.
+                //
+                // Aerith is deliberately absent from the vanilla chain, which is
+                // why only seven characters appear here.
+                else if (static_cast<quint8>(d.at(pos)) == 0xC8 && len == 2) {
+                    const int cid = static_cast<quint8>(d.at(pos + 1));
+                    for (int k = 0; k < len; ++k) d[pos + k] = static_cast<char>(0x5F);
+                    ++nopped;
+                    dbg << "  CRATER_SPLIT: " << fieldName
+                        << " NOP'd PRTYP (add char " << cid << " to party) @"
+                        << (pos - sd) << "\n";
+                }
                 pos += len;
             }
         }
@@ -5188,6 +5452,12 @@ bool FieldPickupRandomizer_ff7tk::loadApJson(
             static_cast<quint8>(address),
             static_cast<quint8>(bit),
         };
+        // Kept for the pickup message. "item" is the AP item name (which may be
+        // another game's item entirely), "item_owner" the player receiving it.
+        // Both are always present in the seed - see json_export._serialize_placements.
+        coord.apItem  = p["item"].toString().trimmed();
+        coord.apOwner = p["item_owner"].toString().trimmed();
+        coord.apLocal = p["item_is_local"].toBool(true);
 
         // Register the detection coord under EVERY field the location can appear
         // in, not just the single "map". A location is often reachable as several
@@ -5263,13 +5533,188 @@ static int jsonBankToNibble(quint8 jsonBank)
 //                              if no JSON entry matches.
 // ============================================================================
 
+// ============================================================================
+// composeApPickupText  -  build the message a chest shows for an AP placement
+//
+// Local item:   Received "Hi-Potion"!
+// Remote item:  Sent "Rocket Launcher"
+//               to Bob!
+//
+// FF7 field windows do NOT wrap: text runs past the frame and is clipped. The
+// window is sized by the WINDOW opcode that precedes MESSAGE, and we are
+// reusing the vanilla one, which was sized for a vanilla item name. So we break
+// the line ourselves at 0xE7 (the same newline byte the crater welcome banner
+// uses) and keep each line inside kMaxLine, truncating a very long name rather
+// than letting it spill out of the frame.
+// ============================================================================
+
+QByteArray FieldPickupRandomizer_ff7tk::composeApPickupText(
+    const ApBitonCoord& placement,
+    QTextStream& debugStream,
+    int* outLines,
+    int* outCols) const
+{
+    // Vanilla pickup windows fit roughly this much before the frame clips. Kept
+    // deliberately conservative: an over-long line is unreadable in game, while
+    // an over-short one merely wraps early.
+    // 32 columns needs a ~244px window; vanilla uses that width routinely
+    // (241 samples at exactly 32 cols, median width 227). Wider lines mean
+    // fewer wraps, and every message either gets its window resized below or
+    // has no WINDOW opcode at all, in which case the game auto-sizes it.
+    constexpr int kMaxLine = 32;
+    constexpr char kNewline = static_cast<char>(0xE7);
+
+    if (placement.apItem.isEmpty())
+        return QByteArray();   // nothing to say - leave the vanilla text alone
+
+    // Greedy word wrap. Up to kMaxLines because resizeMessageWindow can grow the
+    // box to match (vanilla heights are 16 per line plus 9 of frame), so wrapping
+    // beats truncating: item names like "Huge Materia (Underwater)" do not fit
+    // two lines but read fine on three.
+    constexpr int kMaxLines = 3;
+    auto wrap = [&](const QString& sentence) {
+        QStringList out;
+        QString line;
+        for (const QString& word : sentence.split(QChar(' '), Qt::SkipEmptyParts)) {
+            const QString candidate = line.isEmpty() ? word : line + QChar(' ') + word;
+            if (candidate.size() <= kMaxLine) {
+                line = candidate;
+                continue;
+            }
+            if (!line.isEmpty()) out << line;
+            // A single word longer than a line has nowhere to break; it is the
+            // only case where we still cut, and it takes a "~" so the player can
+            // see the name was shortened rather than mis-set.
+            line = word.size() <= kMaxLine ? word
+                                           : word.left(kMaxLine - 1) + QStringLiteral("~");
+        }
+        if (!line.isEmpty()) out << line;
+        while (out.size() > kMaxLines) {
+            // Should not happen for real item/player names; fold the tail rather
+            // than silently dropping it.
+            const QString tail = out.takeLast();
+            out.last() = out.last().left(qMax(0, kMaxLine - 1)) + QStringLiteral("~");
+            Q_UNUSED(tail);
+        }
+        return out;
+    };
+
+    QStringList lines;
+    if (placement.apLocal || placement.apOwner.isEmpty()) {
+        // Your own item. Mirrors the vanilla sentence so the field reads normally.
+        lines = wrap(QStringLiteral("Received \"%1\"!").arg(placement.apItem));
+    } else {
+        // Someone else's item. Naming the player is the point: it tells you the
+        // check fired and where the item went, which a bare item name does not.
+        lines = wrap(QStringLiteral("Sent \"%1\" to %2!")
+                         .arg(placement.apItem, placement.apOwner));
+    }
+
+    QByteArray out;
+    int widest = 0;
+    for (int i = 0; i < lines.size(); ++i) {
+        if (i) out.append(kNewline);
+        out.append(FF7Text::toFF7(lines[i]));
+        widest = qMax(widest, lines[i].size());
+    }
+    if (outLines) *outLines = lines.size();
+    if (outCols)  *outCols  = widest;
+    debugStream << "    AP_TEXT: " << lines.join(QStringLiteral(" / ")) << "\n";
+    return out;
+}
+
+// ============================================================================
+// resizeMessageWindow  -  make the vanilla WINDOW fit our replacement text
+//
+// FF7 does not wrap or auto-grow a scripted window: text past the frame is
+// simply not drawn. Vanilla pickup windows were sized for one short line, and
+// an Archipelago message is usually two ("Sent "X" / to Bob!"), so reusing the
+// vanilla box would clip half of every message.
+//
+// Sizes come from measuring all 10,107 WINDOW/MESSAGE pairs in vanilla flevel:
+// median height is 25/41/57/73 for 1/2/3/4 lines - exactly 16 per line plus 9
+// of frame. Width tracks the longest line; ~7px per character plus frame
+// matches the vanilla medians (1 line 154, 2 lines 174, 3 lines 209).
+//
+// Only ever GROWS the window, and clamps to the 320x240 screen, nudging x/y
+// back if the wider box would run off the edge.
+// ============================================================================
+
+bool FieldPickupRandomizer_ff7tk::resizeMessageWindow(
+    QByteArray& decompressed,
+    int messageOffset,
+    int scriptStart,
+    int lines,
+    int cols,
+    QTextStream& debugStream) const
+{
+    constexpr int kWindowOpcode = 0x50;
+    constexpr int kWindowSize   = 10;   // 0x50, id, x u16, y u16, w u16, h u16
+    constexpr int kScreenW      = 320;
+    constexpr int kScreenH      = 240;
+
+    if (messageOffset + 2 >= decompressed.size()) return false;
+    const quint8 winId = static_cast<quint8>(decompressed.at(messageOffset + 1));
+
+    // The WINDOW that configures this id is nearly always a few opcodes before
+    // the MESSAGE. Search back a bounded distance and take the nearest match
+    // whose fields are plausible - 0x50 also occurs as operand data.
+    // Whole script region, not a fixed 300-byte window: measured on vanilla,
+    // widening this recovers 40 of 158 pickups whose WINDOW sits further back.
+    // The remaining ~23% have no WINDOW opcode at all, which is fine - vanilla
+    // does the same for 4,453 messages, 69% of them multi-line, so the game
+    // auto-sizes those.
+    const int searchStart = scriptStart;
+    for (int pos = messageOffset - 1; pos >= searchStart; --pos) {
+        if (static_cast<quint8>(decompressed.at(pos)) != kWindowOpcode) continue;
+        if (pos + kWindowSize > decompressed.size()) continue;
+        if (static_cast<quint8>(decompressed.at(pos + 1)) != winId) continue;
+
+        quint16 x, y, w, h;
+        memcpy(&x, decompressed.constData() + pos + 2, 2);
+        memcpy(&y, decompressed.constData() + pos + 4, 2);
+        memcpy(&w, decompressed.constData() + pos + 6, 2);
+        memcpy(&h, decompressed.constData() + pos + 8, 2);
+        if (w == 0 || h == 0 || w > kScreenW || h > kScreenH) continue;  // not a WINDOW
+
+        const quint16 wantH = static_cast<quint16>(16 * lines + 9);
+        const quint16 wantW = static_cast<quint16>(qBound(60, cols * 7 + 20, kScreenW));
+        quint16 newW = qMax(w, wantW);
+        quint16 newH = qMax(h, wantH);
+        quint16 newX = x, newY = y;
+        if (newX + newW > kScreenW) newX = static_cast<quint16>(qMax(0, kScreenW - newW));
+        if (newY + newH > kScreenH) newY = static_cast<quint16>(qMax(0, kScreenH - newH));
+
+        if (newW == w && newH == h && newX == x && newY == y)
+            return false;   // already big enough
+
+        memcpy(decompressed.data() + pos + 2, &newX, 2);
+        memcpy(decompressed.data() + pos + 4, &newY, 2);
+        memcpy(decompressed.data() + pos + 6, &newW, 2);
+        memcpy(decompressed.data() + pos + 8, &newH, 2);
+        debugStream << "    AP_WINDOW @" << pos << " id=" << winId
+                    << "  " << w << "x" << h << " -> " << newW << "x" << newH
+                    << " (" << lines << " lines, " << cols << " cols)\n";
+        return true;
+    }
+
+    debugStream << "    AP_WINDOW: no WINDOW for id " << winId
+                << " before MESSAGE @" << messageOffset
+                << " - text may be clipped if it needs more than one line\n";
+    return false;
+}
+
 bool FieldPickupRandomizer_ff7tk::applySTITMAsArchipelago(
     STITMInfo& info,
     QByteArray& fieldData,
     const QString& fieldName,
-    QTextStream& debugStream)
+    QTextStream& debugStream,
+    QByteArray* outText,
+    int* outLines,
+    int* outCols)
 {
     if (info.offset + STITM_SIZE > fieldData.size()) return false;
+    int outTextLines = 1, outTextCols = 0;
 
     QString itemName = getItemName(info.originalItemID).toLower().trimmed();
     QString key      = fieldName.toLower().trimmed() + QChar('|') + itemName;
@@ -5326,6 +5771,12 @@ bool FieldPickupRandomizer_ff7tk::applySTITMAsArchipelago(
     entry.bit            = bit;
     m_apBitonEntries.append(entry);
 
+    if (outText)
+        *outText = composeApPickupText(biton, debugStream,
+                                       &outTextLines, &outTextCols);
+    if (outLines) *outLines = outTextLines;
+    if (outCols)  *outCols  = outTextCols;
+
     debugStream << "  AP_STITM @" << info.offset
                 << "  " << entry.originalName
                 << " (" << info.originalItemID << ")"
@@ -5345,9 +5796,13 @@ bool FieldPickupRandomizer_ff7tk::applySMTRAAsArchipelago(
     SMTRAInfo& info,
     QByteArray& fieldData,
     const QString& fieldName,
-    QTextStream& debugStream)
+    QTextStream& debugStream,
+    QByteArray* outText,
+    int* outLines,
+    int* outCols)
 {
     if (info.offset + SMTRA_SIZE > fieldData.size()) return false;
+    int outTextLines = 1, outTextCols = 0;
 
     QString materiaName = getMateriaName(info.originalMateriaID).toLower().trimmed();
     QString key         = fieldName.toLower().trimmed() + QChar('|') + materiaName;
@@ -5403,6 +5858,12 @@ bool FieldPickupRandomizer_ff7tk::applySMTRAAsArchipelago(
     entry.bit              = bit;
     m_apBitonEntries.append(entry);
 
+    if (outText)
+        *outText = composeApPickupText(biton, debugStream,
+                                       &outTextLines, &outTextCols);
+    if (outLines) *outLines = outTextLines;
+    if (outCols)  *outCols  = outTextCols;
+
     debugStream << "  AP_SMTRA @" << info.offset
                 << "  " << entry.originalName
                 << " (" << info.originalMateriaID << ")"
@@ -5454,7 +5915,8 @@ static QString getCategoryItemName(const QString& itemName)
 int FieldPickupRandomizer_ff7tk::replaceVanillaBitonsForAP(
     QByteArray& decompressed,
     const QString& fieldName,
-    QTextStream& debugStream)
+    QTextStream& debugStream,
+    QVector<OpcodeModification>* mods)
 {
     int modified = 0;
     const int fileSize = decompressed.size();
@@ -5583,6 +6045,22 @@ int FieldPickupRandomizer_ff7tk::replaceVanillaBitonsForAP(
                         entry.address = apBiton.address;
                         entry.bit = apBiton.bit;
                         m_apBitonEntries.append(entry);
+
+                        // Same treatment as a STITM/SMTRA placement: the chest
+                        // should name what Archipelago put here. Vanilla key-item
+                        // text reads `Received Key Item "Keycard 62"!`, so the
+                        // keyItemName gives updateFieldTexts a reliable way to
+                        // find the right MESSAGE. Shared/sibling BITONs each get
+                        // their own entry: they are separate code paths in the
+                        // field and each has its own message.
+                        if (mods) {
+                            int lines = 1, cols = 0;
+                            const QByteArray text =
+                                composeApPickupText(apBiton, debugStream, &lines, &cols);
+                            if (!text.isEmpty())
+                                mods->append(OpcodeModification(i, text, lines, cols,
+                                                                keyItemName));
+                        }
 
                         modified++;
                     } else {
@@ -5786,8 +6264,49 @@ bool FieldPickupRandomizer_ff7tk::updateFieldTexts(
     QVector<QPair<int, int>> messagePatches;  // (absOffset of MESSAGE textID byte, newTextID)
     QSet<int> usedMessageOffsets;             // prevent double-assignment
 
+    // Does a candidate message actually announce this pickup? The vanilla text
+    // reads `Received "Ether"!`, so the message belonging to an Ether STITM is
+    // the one naming Ether. Matching on that instead of pure proximity is what
+    // stops chest clusters cross-assigning: measured on vanilla flevel, nearest-
+    // MESSAGE alone mis-assigns 28 of the 152 pickups whose text names an item
+    // (blin62_1 gives its three source pickups Elixir/Ether/Potion, each of them
+    // a neighbour's message).
+    auto messageNames = [&](int msgOff, const QString& wanted) {
+        if (wanted.isEmpty()) return false;
+        const quint8 txtID = static_cast<quint8>(decompressed.at(msgOff + 2));
+        if (txtID >= textEntries.size()) return false;
+        const QString body = FF7Text::toPC(textEntries[txtID]);
+        // Compare loosely: the game's own spelling differs from the item table
+        // here and there ("Four Slot" vs "Four Slots", "Glow Lance" vs "Grow
+        // Lance"), and punctuation/case carry no signal.
+        auto squash = [](const QString& in) {
+            QString out;
+            for (const QChar& c : in)
+                if (c.isLetterOrNumber()) out += c.toLower();
+            return out;
+        };
+        const QString a = squash(body), b = squash(wanted);
+        if (a.isEmpty() || b.isEmpty()) return false;
+        if (a.contains(b)) return true;
+        // Tolerate a one-character spelling drift on longer names.
+        if (b.size() >= 6 && a.contains(b.left(b.size() - 1))) return true;
+        // The game often drops our parenthetical qualifier: ncorel3 says
+        // `Received Key Item "Huge Materia"!` where the table says
+        // "Huge Materia (Corel)". Retry on the part before the bracket. If a
+        // field holds two of them (rcktin4 has Corel and Fort Condor) the
+        // used-message guard stops both claiming the same text; the second is
+        // skipped rather than mislabelled.
+        const int bracket = wanted.indexOf(QLatin1Char('('));
+        if (bracket > 0) {
+            const QString stem = squash(wanted.left(bracket));
+            if (stem.size() >= 6 && a.contains(stem)) return true;
+        }
+        return false;
+    };
+
     for (const auto& mod : modifications) {
         int backOff = -1, fwdOff = -1;
+        int namedOff = -1;   // candidate whose text names the vanilla item
 
         // Search backward first (up to 500 bytes)
         {
@@ -5798,8 +6317,10 @@ bool FieldPickupRandomizer_ff7tk::updateFieldTexts(
                     quint8 winID = static_cast<quint8>(decompressed.at(pos + 1));
                     quint8 txtID = static_cast<quint8>(decompressed.at(pos + 2));
                     if (winID <= 15 && txtID < textCount && !usedMessageOffsets.contains(pos)) {
-                        backOff = pos;
-                        break;
+                        if (backOff < 0) backOff = pos;
+                        if (namedOff < 0 && messageNames(pos, mod.vanillaName))
+                            namedOff = pos;
+                        if (backOff >= 0 && namedOff >= 0) break;
                     }
                 }
             }
@@ -5818,23 +6339,28 @@ bool FieldPickupRandomizer_ff7tk::updateFieldTexts(
                     quint8 winID = static_cast<quint8>(decompressed.at(pos + 1));
                     quint8 txtID = static_cast<quint8>(decompressed.at(pos + 2));
                     if (winID <= 15 && txtID < textCount && !usedMessageOffsets.contains(pos)) {
-                        fwdOff = pos;
-                        break;
+                        if (fwdOff < 0) fwdOff = pos;
+                        if (namedOff < 0 && messageNames(pos, mod.vanillaName))
+                            namedOff = pos;
+                        if (fwdOff >= 0 && namedOff >= 0) break;
                     }
                 }
             }
         }
 
-        // Pick the closest MESSAGE
-        int messageOff = -1;
-        if (backOff >= 0 && fwdOff >= 0) {
-            int backDist = mod.opcodeOffset - backOff;
-            int fwdDist  = fwdOff - mod.opcodeOffset;
-            messageOff = (backDist <= fwdDist) ? backOff : fwdOff;
-        } else if (backOff >= 0) {
-            messageOff = backOff;
-        } else if (fwdOff >= 0) {
-            messageOff = fwdOff;
+        // A message that names the item wins outright; proximity is only the
+        // tie-breaker when nothing names it.
+        int messageOff = namedOff;
+        if (messageOff < 0) {
+            if (backOff >= 0 && fwdOff >= 0) {
+                int backDist = mod.opcodeOffset - backOff;
+                int fwdDist  = fwdOff - mod.opcodeOffset;
+                messageOff = (backDist <= fwdDist) ? backOff : fwdOff;
+            } else if (backOff >= 0) {
+                messageOff = backOff;
+            } else if (fwdOff >= 0) {
+                messageOff = fwdOff;
+            }
         }
 
         if (messageOff < 0) {
@@ -5842,14 +6368,33 @@ bool FieldPickupRandomizer_ff7tk::updateFieldTexts(
             continue;
         }
 
-        // Build new text string
-        QString newTextStr;
-        if (mod.isMateria)
-            newTextStr = QStringLiteral("Received \"%1\" Materia!").arg(mod.newName);
-        else
-            newTextStr = QStringLiteral("Received \"%1\"!").arg(mod.newName);
+        // For an Archipelago placement, refuse to guess. Most MESSAGEs near a
+        // pickup are ordinary dialogue, and overwriting an NPC's line with
+        // `Sent "X" to Bob!` is far worse than leaving the vanilla item name in
+        // place. Only rewrite when the message demonstrably announces THIS
+        // pickup. The standalone randomizer keeps its old proximity behaviour.
+        if (!mod.encodedText.isEmpty() && namedOff < 0) {
+            debugStream << "  AP_TEXT SKIP @" << mod.opcodeOffset
+                        << ": no message names \"" << mod.vanillaName
+                        << "\" - left vanilla rather than risk clobbering dialogue\n";
+            continue;
+        }
 
-        QByteArray newTextData = FF7Text::toFF7(newTextStr);
+        // Build new text string. An Archipelago placement arrives already
+        // composed and encoded (see composeApPickupText) because its sentence
+        // depends on the receiving player, not on the vanilla opcode.
+        QString newTextStr;
+        QByteArray newTextData;
+        if (!mod.encodedText.isEmpty()) {
+            newTextData = mod.encodedText;
+            newTextStr  = QStringLiteral("(archipelago)");
+        } else {
+            if (mod.isMateria)
+                newTextStr = QStringLiteral("Received \"%1\" Materia!").arg(mod.newName);
+            else
+                newTextStr = QStringLiteral("Received \"%1\"!").arg(mod.newName);
+            newTextData = FF7Text::toFF7(newTextStr);
+        }
 
         int newTextID = textCount + newTextEntries.size();
         if (newTextID > 255) {
@@ -5861,6 +6406,19 @@ bool FieldPickupRandomizer_ff7tk::updateFieldTexts(
         messagePatches.append({messageOff + 2, newTextID}); // +2 = textID byte offset
         usedMessageOffsets.insert(messageOff);
         anyChanged = true;
+
+        // Grow the window BEFORE the section is rebuilt: this edits the script
+        // region, which sits ahead of the text section and so does not move.
+        //
+        // Runs for ONE-line messages too. That was the bug behind "windows are
+        // too small": `Sent "Vivian" to FoomTTYD!` is 26 columns and needs about
+        // 191px, but it inherited the window vanilla sized for
+        // `Received "Potion"!` (18 columns, ~146px) and was clipped on the
+        // right. Height is unchanged for a single line, so this only ever adds
+        // the width the new text needs.
+        if (!mod.encodedText.isEmpty() || mod.textLines > 1)
+            resizeMessageWindow(decompressed, messageOff, sec0DataStart,
+                                mod.textLines, mod.textCols, debugStream);
 
         debugStream << "  MSG @" << messageOff << " textID "
                     << static_cast<int>(static_cast<quint8>(decompressed.at(messageOff + 2)))
@@ -6718,31 +7276,29 @@ QString FieldPickupRandomizer_ff7tk::getMateriaName(quint8 materiaId) const
 // Helpers
 // ============================================================================
 
-QString FieldPickupRandomizer_ff7tk::findFlevelPath() const
+QStringList FieldPickupRandomizer_ff7tk::flevelCandidates() const
 {
-    if (!m_parent) return QString();
+    if (!m_parent) return QStringList();
 
-    QString ff7Path = m_parent->getFF7Path();
-    QStringList candidates = {
+    // One source of truth for both the search and the error message, so the
+    // "looked in" list can never drift from where we actually looked.
+    const QString ff7Path = m_parent->getFF7Path();
+    const QString outputPath = m_parent->getOutputPath();
+    return {
         ff7Path + "/data/field/flevel.lgp",
         ff7Path + "/data/flevel/flevel.lgp",
         ff7Path + "/field/flevel.lgp",
-    };
-
-    for (const QString& p : candidates) {
-        if (QFile::exists(p)) return p;
-    }
-
-    // Also check if user placed it in the output folder already
-    QString outputPath = m_parent->getOutputPath();
-    QStringList outputCandidates = {
+        // The user may have staged a copy in the output folder already.
         outputPath + "/data/field/flevel.lgp",
         outputPath + "/data/flevel/flevel.lgp",
     };
-    for (const QString& p : outputCandidates) {
+}
+
+QString FieldPickupRandomizer_ff7tk::findFlevelPath() const
+{
+    for (const QString& p : flevelCandidates()) {
         if (QFile::exists(p)) return p;
     }
-
     return QString();
 }
 
